@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+
+# 테스트 출력 이미지
+out.png
+*.png
+*.jpg
+*.jpeg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 모델 캐시 / 대용량 파일
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+
+# 로그
+*.log
+logs/
