@@ -1,54 +1,74 @@
 """diffusionkit FluxPipeline HTTP 서버.
 
-이미지 1장 생성 후 프로세스 자체를 종료한다.
-→ Apple Silicon Unified Memory 완전 반환.
-
-요청 전 자동 시작: diffusionkit_service.py가 필요 시 subprocess로 띄움.
-
-실행:
-    /Users/bumsuklee/miniconda3/envs/diffusionkit/bin/python3.10 server.py
+모델 상주 + 아이들 타임아웃 방식 (mFlux server.py와 동일).
+- 첫 요청 시 모델 로드, 이후 재사용
+- 마지막 요청 후 3분 경과 시 자동 종료 (Metal GPU 메모리 OS 반환)
+- 다음 요청 시 diffusionkit_service가 자동 재기동
 
 포트: 18188
 엔드포인트:
     GET  /health    — 상태 확인
-    POST /generate  — 이미지 생성 (완료 후 프로세스 종료)
+    POST /generate  — 이미지 생성
+    POST /shutdown  — 명시적 종료
 """
 
+import argparse
 import base64
 import io
 import json
 import logging
 import os
 import signal
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from threading import Timer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("flux-server")
 
-MODEL_VERSION = "argmaxinc/mlx-FLUX.1-schnell-4bit-quantized"
-PORT = 18188
+MODEL_SCHNELL = "argmaxinc/mlx-FLUX.1-schnell-4bit-quantized"
+MODEL_DEV = "argmaxinc/mlx-FLUX.1-dev"
+DEFAULT_PORT = 18188
+IDLE_TIMEOUT = 180  # 3분
 
-_pipeline = None
+_pipelines: dict = {}
+_lock = threading.Lock()
+_idle_timer: Timer | None = None
+_last_request_time = 0.0
 
 
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        logger.info(f"FluxPipeline 로딩: {MODEL_VERSION}")
-        t = time.time()
-        from diffusionkit.mlx import FluxPipeline
-        _pipeline = FluxPipeline(model_version=MODEL_VERSION, low_memory_mode=False)
-        logger.info(f"FluxPipeline 로딩 완료: {time.time() - t:.1f}s")
-    return _pipeline
+def _schedule_idle_shutdown():
+    global _idle_timer
+    if _idle_timer:
+        _idle_timer.cancel()
+    _idle_timer = Timer(IDLE_TIMEOUT, _idle_shutdown)
+    _idle_timer.daemon = True
+    _idle_timer.start()
+
+
+def _idle_shutdown():
+    elapsed = time.time() - _last_request_time
+    if elapsed < IDLE_TIMEOUT - 5:
+        _schedule_idle_shutdown()
+        return
+    logger.info(f"아이들 {IDLE_TIMEOUT}초 경과 → 프로세스 종료 (Metal GPU 메모리 반환)")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def get_pipeline(model_version: str = MODEL_SCHNELL):
+    with _lock:
+        if model_version not in _pipelines:
+            logger.info(f"FluxPipeline 로딩: {model_version}")
+            t = time.time()
+            from diffusionkit.mlx import FluxPipeline
+            _pipelines[model_version] = FluxPipeline(model_version=model_version, low_memory_mode=False)
+            logger.info(f"FluxPipeline 로딩 완료: {time.time() - t:.1f}s")
+    return _pipelines[model_version]
 
 
 def _shutdown():
-    """응답 전송 후 프로세스 종료 — Unified Memory 완전 반환."""
     logger.info("프로세스 종료 (Metal GPU 메모리 OS 반환)")
     os.kill(os.getpid(), signal.SIGTERM)
 
@@ -67,11 +87,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send_json(200, {"status": "ok", "model": MODEL_VERSION})
+            self._send_json(200, {"status": "ok", "model": MODEL_SCHNELL, "loaded": bool(_pipelines)})
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        global _last_request_time
+
+        if self.path == "/shutdown":
+            self._send_json(200, {"success": True, "message": "shutting down"})
+            Timer(0.3, _shutdown).start()
+            return
+
         if self.path != "/generate":
             self._send_json(404, {"error": "not found"})
             return
@@ -90,14 +117,15 @@ class Handler(BaseHTTPRequestHandler):
         seed = body.get("seed", None)
         ref_image_b64 = body.get("ref_image_b64", None)
         denoise = float(body.get("denoise", 1.0))
+        flux_model = body.get("flux_model", "schnell")
+        model_version = MODEL_DEV if flux_model == "dev" else MODEL_SCHNELL
+
+        _last_request_time = time.time()
 
         try:
-            pipeline = get_pipeline()
+            pipeline = get_pipeline(model_version)
             t = time.time()
-            logger.info(
-                f"생성 시작: {width}x{height}, steps={steps}, "
-                f"denoise={denoise}, prompt={prompt[:60]}..."
-            )
+            logger.info(f"생성 시작: {width}x{height}, steps={steps}, denoise={denoise}, prompt={prompt[:60]}...")
 
             image_path = None
             if ref_image_b64:
@@ -144,12 +172,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"success": False, "error": str(e)})
 
         finally:
-            # 응답 완료 후 0.5초 뒤 프로세스 종료 → GPU 메모리 OS 반환
-            Timer(0.5, _shutdown).start()
+            _last_request_time = time.time()
+            _schedule_idle_shutdown()
 
 
 if __name__ == "__main__":
-    logger.info(f"flux-server 시작 (port {PORT})")
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    logger.info(f"Ready: http://127.0.0.1:{PORT}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--preload", action="store_true")
+    args = parser.parse_args()
+    port = args.port
+
+    logger.info(f"flux-server 시작 (port {port}, idle_timeout={IDLE_TIMEOUT}s)")
+    if args.preload:
+        get_pipeline()
+        _last_request_time = time.time()
+        _schedule_idle_shutdown()
+    server = HTTPServer(("127.0.0.1", port), Handler)
+    logger.info(f"Ready: http://127.0.0.1:{port}")
     server.serve_forever()
